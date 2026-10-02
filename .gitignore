@@ -1,0 +1,5 @@
+*.zip
+*.img
+*.tar.md5
+*.tar
+__pycache__/

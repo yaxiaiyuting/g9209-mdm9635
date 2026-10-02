@@ -1,0 +1,187 @@
+diff --git a/drivers/usb/misc/ks_bridge.c b/drivers/usb/misc/ks_bridge.c
+index 377373f5573..e7c91441859 100644
+--- a/drivers/usb/misc/ks_bridge.c
++++ b/drivers/usb/misc/ks_bridge.c
+@@ -77,7 +77,12 @@ struct ks_bridge {
+ 	char			*name;
+ 	spinlock_t		lock;
+ 	struct workqueue_struct	*wq;
+-	struct work_struct	to_mdm_work;
++	struct delayed_work	to_mdm_work;
++	unsigned char		*tx_acc;
++	int			tx_acc_len;
++	int			tx_acc_sz;
++	int			req_len;
++	int			req_left;
+ 	struct work_struct	start_rx_work;
+ 	struct list_head	to_mdm_list;
+ 	struct list_head	to_ks_list;
+@@ -290,10 +295,50 @@ static void ksb_tx_cb(struct urb *urb)
+ 	wake_up(&ksb->pending_urb_wait);
+ }
+ 
++/* [MDM-bringup] 把聚合缓冲里的字节打包进 to_mdm_list（不持锁分配，锁内校验） */
++#define KSB_AGG_MAX   16384
++static void ksb_agg_flush_all(struct ks_bridge *ksb)
++{
++	unsigned long flags;
++	struct data_pkt *pkt;
++	int n;
++	unsigned int want;
++
++	spin_lock_irqsave(&ksb->lock, flags);
++	n = ksb->tx_acc_len;
++	spin_unlock_irqrestore(&ksb->lock, flags);
++	if (n <= 0 || n > ksb->tx_acc_sz)
++		return;
++
++	pkt = ksb_alloc_data_pkt(n, GFP_KERNEL, ksb);
++	if (IS_ERR(pkt))
++		return;
++
++	spin_lock_irqsave(&ksb->lock, flags);
++	if (ksb->tx_acc_len != n) {           /* 期间被改过 → 放弃本次，避免越界/错位 */
++		spin_unlock_irqrestore(&ksb->lock, flags);
++		ksb_free_data_pkt(pkt);
++		return;
++	}
++	want = (unsigned int)n;
++	memcpy(pkt->buf, ksb->tx_acc, want);
++	pkt->len = want;
++	ksb->tx_acc_len = 0;
++	ksb->req_left -= (int)want;           /* ★ 递减；减到 0 表示该请求发完 */
++	if (ksb->req_left < 0)
++		ksb->req_left = 0;
++	if (ksb->req_left == 0)
++		ksb->req_len = 0;
++	list_add_tail(&pkt->list, &ksb->to_mdm_list);
++	spin_unlock_irqrestore(&ksb->lock, flags);
++}
++
+ static void ksb_tomdm_work(struct work_struct *w)
+ {
+-	struct ks_bridge *ksb = container_of(w, struct ks_bridge, to_mdm_work);
++	struct ks_bridge *ksb = container_of(to_delayed_work(w), struct ks_bridge, to_mdm_work);
+ 	struct data_pkt	*pkt;
++	ksb_agg_flush_all(ksb);               /* 先把聚合缓冲的残余打成包 */
++	if (ksb->tx_acc_len > 0) return;      /* 极小概率的竞争：下次再来 */
+ 	unsigned long flags;
+ 	struct urb *urb;
+ 	int ret;
+@@ -382,11 +427,70 @@ static ssize_t ksb_fs_write(struct file *fp, const char __user *buf,
+ 		return ret;
+ 	}
+ 
++	/* [MDM-bringup] 诊断：打印 ks 实际写入的字节（纯打印，不改逻辑） */
++	{
++		static int n_small = 0, n_big = 0;
++		if (count <= 64) {
++			if (n_small < 40) {
++				print_hex_dump(KERN_INFO, "KSB-WC: ", DUMP_PREFIX_OFFSET, 16, 1,
++					       pkt->buf, count, false);
++				n_small++;
++			}
++		} else if (n_big < 2) {
++			print_hex_dump(KERN_INFO, "KSB-WD: ", DUMP_PREFIX_OFFSET, 16, 1,
++				       pkt->buf, count > 96 ? 96 : count, false);
++			n_big++;
++		}
++	}
++
++	/* [MDM-bringup v2] ks 的写入粒度是 4 字节（控制包与数据都一样）。
++	 * 三条件任一满足即冲刷：1) 成帧 2) 达阈值 3) 2ms 超时（由 delayed work 触发）。 */
++	if (count <= 8) {
++		unsigned int need; int full; int overflow;
++		spin_lock_irqsave(&ksb->lock, flags);
++		overflow = (ksb->tx_acc_len + (int)count > ksb->tx_acc_sz);
++		if (!overflow) {
++			memcpy(ksb->tx_acc + ksb->tx_acc_len, pkt->buf, count);
++			ksb->tx_acc_len += (int)count;
++		}
++		need = 8;
++		if (!overflow && ksb->tx_acc_len >= 8) {
++			unsigned int l = (unsigned int)ksb->tx_acc[4] | ((unsigned int)ksb->tx_acc[5] << 8) |
++					 ((unsigned int)ksb->tx_acc[6] << 16) | ((unsigned int)ksb->tx_acc[7] << 24);
++			if (l >= 8 && l <= 64)
++				need = l;                     /* 控制包：精确按头长度成帧 */
++			else if (ksb->req_left > 0) {
++				/* ★ 数据：按 modem 请求的剩余量分块（一次最多缓冲大小） */
++				need = (ksb->req_left > ksb->tx_acc_sz) ?
++					(unsigned int)ksb->tx_acc_sz : (unsigned int)ksb->req_left;
++			}
++			else
++				need = KSB_AGG_MAX;           /* 兜底阈值 */
++		}
++		full = (!overflow && ksb->tx_acc_len >= (int)need);
++		spin_unlock_irqrestore(&ksb->lock, flags);
++		ksb_free_data_pkt(pkt);
++		if (overflow) {
++			ksb_agg_flush_all(ksb);           /* 缓冲满：先冲掉，本次写入丢失风险最低 */
++			return count;
++		}
++		if (full) {
++			queue_work(ksb->wq, &ksb->to_mdm_work.work);
++		} else if (need == KSB_AGG_MAX || (ksb->req_left <= 0)) {
++			/* 控制包成帧未凑齐 / 兜底阈值：用 2ms 超时冲刷 */
++			schedule_delayed_work(&ksb->to_mdm_work, msecs_to_jiffies(2));
++		} else {
++			/* ★ 数据路径（等 modem 请求的整块）：**不设超时**，攒满即发，
++			 *   避免超时把 4096 的请求切成 3772 这种尺寸 ✗ */
++		}
++		return count;
++	}
++
+ 	spin_lock_irqsave(&ksb->lock, flags);
+ 	list_add_tail(&pkt->list, &ksb->to_mdm_list);
+ 	spin_unlock_irqrestore(&ksb->lock, flags);
+ 
+-	queue_work(ksb->wq, &ksb->to_mdm_work);
++	queue_work(ksb->wq, &ksb->to_mdm_work.work);
+ 
+ 	return count;
+ }
+@@ -597,6 +701,20 @@ static void ksb_rx_cb(struct urb *urb)
+ 	}
+ 
+ add_to_list:
++	/* [MDM-bringup] 记录 modem 的 READ_DATA 请求长度：TX 聚合据此按"请求边界"分块 */
++	if (urb->actual_length >= 20) {
++		unsigned char *b = (unsigned char *)pkt->buf;
++		unsigned int c = (unsigned int)b[0] | ((unsigned int)b[1] << 8) |
++				 ((unsigned int)b[2] << 16) | ((unsigned int)b[3] << 24);
++		if (c == 3) {                     /* SAHARA_READ_DATA */
++			unsigned int l = (unsigned int)b[16] | ((unsigned int)b[17] << 8) |
++					 ((unsigned int)b[18] << 16) | ((unsigned int)b[19] << 24);
++			if (l > 0 && l <= 16U * 1024U * 1024U && ksb->tx_acc_len == 0) {
++				ksb->req_len = (int)l;
++				ksb->req_left = (int)l;      /* ★ 剩余待发字节（可大于缓冲） */
++			}
++		}
++	}
+ 	spin_lock(&ksb->lock);
+ 	pkt->len = urb->actual_length;
+ 	list_add_tail(&pkt->list, &ksb->to_ks_list);
+@@ -920,7 +1038,7 @@ static void ksb_usb_disconnect(struct usb_interface *ifc)
+ 
+ 	clear_bit(USB_DEV_CONNECTED, &ksb->flags);
+ 	wake_up(&ksb->ks_wait_q);
+-	cancel_work_sync(&ksb->to_mdm_work);
++	cancel_delayed_work_sync(&ksb->to_mdm_work);
+ 	cancel_work_sync(&ksb->start_rx_work);
+ 
+ 	device_destroy(ksb->class, ksb->cdev_start_no);
+@@ -1044,7 +1162,13 @@ static int __init ksb_init(void)
+ 			goto dev_free;
+ 		}
+ 
+-		INIT_WORK(&ksb->to_mdm_work, ksb_tomdm_work);
++		INIT_DELAYED_WORK(&ksb->to_mdm_work, ksb_tomdm_work);
++		/* [MDM-bringup] 聚合缓冲：数据流要攒到 ~16KB 再发（ks 每次只写 4 字节） */
++		ksb->tx_acc_sz = 65536;
++		ksb->tx_acc = kzalloc(ksb->tx_acc_sz, GFP_KERNEL);
++		ksb->tx_acc_len = 0;
++		if (!ksb->tx_acc)
++			pr_err("%s: tx_acc alloc failed (aggregation disabled)\n", ksb->id_info.name);
+ 		INIT_WORK(&ksb->start_rx_work, ksb_start_rx_work);
+ 		init_usb_anchor(&ksb->submitted);
+ 

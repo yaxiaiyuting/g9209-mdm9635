@@ -1,0 +1,19 @@
+diff --git a/drivers/pci/host/pci-exynos.c b/drivers/pci/host/pci-exynos.c
+index 5e70a3b719b..8d11c08504d 100644
+--- a/drivers/pci/host/pci-exynos.c
++++ b/drivers/pci/host/pci-exynos.c
+@@ -379,7 +379,13 @@ retry:
+ 				if(mdm_get_fatal_status()) {
+ 					return -EPIPE;
+ 				} else {
+-					panic("PCIE LINK UP FAIL - NEED CP DUMP");
++					/* [MDM-bringup] 原为 panic("PCIE LINK UP FAIL - NEED CP DUMP")。
++					 * modem 未上电时链路必然失败，panic 会让系统完全无法启动；
++					 * 改为优雅失败：系统正常启动，之后由用户态给 modem 上电，
++					 * 再从 userspace 触发 PCIe rescan / 重新 bind 完成枚举。 */
++					dev_err(dev, "%s: MDM PCIe link not up (modem unpowered?) - deferring\n",
++							__func__);
++					return -EPROBE_DEFER;
+ 				}
+ 			}
+ #endif

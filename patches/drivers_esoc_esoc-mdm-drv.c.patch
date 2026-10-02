@@ -1,0 +1,20 @@
+diff --git a/drivers/esoc/esoc-mdm-drv.c b/drivers/esoc/esoc-mdm-drv.c
+index a6b23fae4a2..9ce08278a2d 100644
+--- a/drivers/esoc/esoc-mdm-drv.c
++++ b/drivers/esoc/esoc-mdm-drv.c
+@@ -171,10 +171,12 @@ static int mdm_subsys_powerup(const struct subsys_desc *crashed_subsys)
+ 		}
+ 	}
+ 
++	/* [MDM-bringup] 原为 60000ms；flashless boot 需要逐个镜像会话 + EFS + modem 自身启动，实测约 250-300s，
++	 * 300s 仍会超时并把 modem 拉进 ramdump 模式。放宽到 900s。 */
+ 	if (!wait_for_completion_timeout(&mdm_drv->boot_done,
+-		msecs_to_jiffies(60000))) {
+-		dev_err(&esoc_clink->dev, "Unable to boot\n");
+-		panic("CP BOOT UP FAIL - NEED CP DUMP");
++		msecs_to_jiffies(900000))) {
++		dev_err(&esoc_clink->dev, "Unable to boot (CP BOOT UP FAIL - NEED CP DUMP suppressed)\n");
++		return -EIO;
+ 	}
+ 
+ 	if (mdm_drv->boot_fail) {

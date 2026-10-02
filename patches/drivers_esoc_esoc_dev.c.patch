@@ -1,0 +1,14 @@
+diff --git a/drivers/esoc/esoc_dev.c b/drivers/esoc/esoc_dev.c
+index ec2c78e9571..67268a5b933 100644
+--- a/drivers/esoc/esoc_dev.c
++++ b/drivers/esoc/esoc_dev.c
+@@ -277,7 +277,8 @@ static long esoc_dev_ioctl(struct file *file, unsigned int cmd,
+ 		put_user(status, (unsigned long __user *)uarg);
+ 		break;
+ 	case ESOC_PANIC:
+-		panic("hello packet timeout or secure boot fail");
++		pr_err("hello packet timeout or secure boot fail (panic suppressed)\n");
++		return -EINVAL;
+ 	default:
+ 		return -EINVAL;
+ 	};
