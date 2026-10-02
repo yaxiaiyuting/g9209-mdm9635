@@ -31,3 +31,17 @@ size 29,360,128 bytes
 
 ## 回退
 用 TWRP 还原备份，或用 Odin/heimdall 刷回原厂 4 件套（AP/BL/CP/CSC_CTC）。
+
+## 附件（可刷包）校验
+```
+文件名: g9209-mdm9635-lineage-20.0-20261003-UNOFFICIAL-zeroflte.zip
+大小  : 753866568 字节 (718 MB)
+md5   : 073e15abb2d9023a01fd025e351e023a
+sha256: 2a97713e8ee261d5122aa09e4b52f9b350c6d91b63a89fec2978d720959fa500
+包内 boot.img md5: 5e575b6a0eb83eb5bd1d731349798d9d
+```
+
+## 刷机
+1. 下载下面的 zip
+2. 进 TWRP → Install → 选择该 zip → 滑动刷入
+3. （务必先备份；回退用 Odin/heimdall 刷原厂 4 件套）
