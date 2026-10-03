@@ -42,6 +42,56 @@
 **一句话**：主机侧（AP）已全部打通，modem 也确实启动到 AMSS；**唯一卡点是 modem 不把自己的
 USB 切成 AMSS 形态**，因此 AP 侧拿不到 `/dev/efs_hsic_bridge`，也就无法做 EFS 同步、无法进 RIL。
 
+
+---
+
+## 1b. ★ 决定性对照（2026-10-03）：原厂 `mdm_helper` 也失败在同一处
+
+为了排除"是不是我们自写的主机侧实现有问题"，我们把 `/system/bin/ks` 换成
+[`tools/ks_passthru.c`](tools/ks_passthru.c)（逐字转发原厂 `mdm_helper` 的 argv，
+只丢掉 `-r`/`--ramdumpimage`/`-q` 这几个开关），然后**让原厂 `mdm_helper` 驱动整条链路**。
+
+| 路线 | 加载 12 镜像 | 到 AMSS | 重新枚举 | 结果 |
+|---|---|---|---|---|
+| 自写加载器 + 自写握手 | ✅ 20 秒 | ✅ | ❌ | 约 11.2 s 后自复位 |
+| **原厂 `mdm_helper` + `ks.real`** | ✅ | ✅ | ❌ | **同样约 11.2 s 后自复位** |
+
+**两条完全不同的主机侧实现得到完全相同的失败现象** → 问题不在 AP 侧实现。
+
+### modem 自己给出的证据
+
+`/cpdump/mdm_err.log`（kickstart dump 出来的 modem 崩溃日志）：
+
+```
+There is not valid Crash Reason, so I guess this crash happen before running
+the err_init() on apps_proc !
+```
+
+即 **崩溃发生在 modem 错误处理器 `err_init()` 初始化之前** —— 极早期。
+配合：`MDM_ERR_FATAL.BIN` 全零、`MDM2AP_ERRFATAL` 全程 `lo`（无软件 fault）、
+`RST_STAT=2`、`PmicPONstat=20 00 02 00 02 00 00 00`（有置位）、
+失败时间常数极稳（≈11.2 s，方差 <0.05 s，硬件计数器特征）。
+
+→ **modem 在 AMSS 极早期被看门狗/受控复位，从未走到"打开自己 USB PHY 并枚举"。**
+
+### 已穷尽排除的 AP 侧变量
+
+| 变量 | 做法 | 结果 |
+|---|---|---|
+| `HSIC_READY` 没被调用 | 内核 printk 实测 | 确实被调用，`after_set1=1` |
+| `HSIC_READY` 时机太晚 | 提前到 STATUS 后 / Sahara 前 / **上电瞬间并全程保持** | 三种都不枚举 |
+| EHCI 不重新枚举 | unbind→10ms→bind | 两次写都成功，仍只有 9008 |
+| req engine 无人持有 | 常驻 daemon | 已修 |
+| `ESOC_BOOT_DONE` 未发 | 已实现 | 已修 |
+| `powerup` 退出关 fd | 持 fd 常驻 | 已修 |
+| 主机实现有问题 | **原厂 `mdm_helper` 对照** | 同样失败 |
+| 镜像内容 | 与原厂 CP 包 md5 9/9 一致 | 排除 |
+
+### 下一步唯一有希望的方向
+
+**把 modem 侧 AMSS 的早期日志引出来**（DIAG / 串口），看它在 `err_init()` 之前
+究竟执行到哪、等的是什么。这是目前唯一还没打开的黑盒。
+
 ---
 
 ## 2. ★ 对既有结论的重要更正
