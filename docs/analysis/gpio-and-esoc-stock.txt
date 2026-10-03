@@ -1,0 +1,25 @@
+=== GPIO 状态（原厂正常）===
+ gpio-8   (MDM2AP_STATUS       ) in  hi
+ gpio-24  (MDM2AP_ERRFATAL     ) in  lo
+ gpio-28  (AP2MDM_ERRFATAL     ) out lo
+ gpio-120 (AP2MDM_STATUS       ) out hi
+ gpio-132 (MDM2AP_VDDMIN       ) in  lo
+ gpio-133 (AP2MDM_VDDMIN       ) out lo
+ gpio-134 (MDM2AP_PBLRDY       ) in  lo
+ gpio-135 (AP2MDM_HSIC_READY   ) out hi
+ gpio-149 (AP2MDM_SOFT_RESET   ) out hi
+
+=== /dev modem 节点 ===
+crw-rw---- 1 radio radio 248,   0 2026-10-03 14:39 /dev/diag
+crw------- 1 root  root  237,   0 2026-10-03 14:39 /dev/efs_hsic_bridge
+
+=== ESOC sysfs ===
+/sys/devices/qcom,mdm1.54/esoc0/esoc_name = 
+/sys/devices/qcom,mdm1.54/esoc0/esoc_link = 
+/sys/devices/qcom,mdm1.54/esoc0/subsys0/state = 
+
+=== PCIe ===
+/sys/bus/pci/devices/0000:00:00.0/ vendor=0x144d device=0xa574
+/sys/bus/pci/devices/0000:01:00.0/ vendor=0x17cb device=0x0300
+/sys/bus/pci/devices/0001:00:00.0/ vendor=0x144d device=0xa575
+/sys/bus/pci/devices/0001:01:00.0/ vendor=0x14e4 device=0x43e9
