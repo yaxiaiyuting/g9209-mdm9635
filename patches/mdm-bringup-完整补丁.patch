@@ -1,0 +1,342 @@
+diff --git a/arch/arm64/mach-exynos/subsystem_restart.c b/arch/arm64/mach-exynos/subsystem_restart.c
+index 8457ecb399e..ca5ecaf442c 100644
+--- a/arch/arm64/mach-exynos/subsystem_restart.c
++++ b/arch/arm64/mach-exynos/subsystem_restart.c
+@@ -327,9 +327,8 @@ static void do_epoch_check(struct subsys_device *dev)
+ 	if (time_first && n >= max_restarts_check) {
+ 		if ((curr_time->tv_sec - time_first->tv_sec) <
+ 				max_history_time_check)
+-			panic("Subsystems have crashed %d times in less than "
+-				"%ld seconds!", max_restarts_check,
+-				max_history_time_check);
++			pr_err("Subsystems have crashed %d times in less than %ld seconds! (continuing)\n",
++				max_restarts_check, max_history_time_check);
+ 	}
+ 
+ out:
+@@ -383,7 +382,7 @@ static void subsystem_shutdown(struct subsys_device *dev, void *data)
+ 
+ 	pr_info("[%p]: Shutting down %s\n", current, name);
+ 	if (dev->desc->shutdown(dev->desc) < 0)
+-		panic("subsys-restart: [%p]: Failed to shutdown %s!",
++		pr_err("subsys-restart: [%p]: Failed to shutdown %s! (continuing)\n",
+ 			current, name);
+ 	subsys_set_state(dev, SUBSYS_OFFLINE);
+ }
+@@ -405,12 +404,14 @@ static void subsystem_powerup(struct subsys_device *dev, void *data)
+ 
+ 	pr_info("[%p]: Powering up %s\n", current, name);
+ 	init_completion(&dev->err_ready);
+-	if (dev->desc->powerup(dev->desc) < 0)
+-		panic("[%p]: Powerup error: %s!", current, name);
++	if (dev->desc->powerup(dev->desc) < 0) {
++		pr_err("[%p]: Powerup error: %s! (continuing)\n", current, name);
++		return;
++	}
+ 
+ 	ret = wait_for_err_ready(dev);
+ 	if (ret)
+-		panic("[%p]: Timed out waiting for error ready: %s!",
++		pr_err("[%p]: Timed out waiting for error ready: %s! (continuing)\n",
+ 			current, name);
+ 	subsys_set_state(dev, SUBSYS_ONLINE);
+ }
+@@ -671,7 +672,7 @@ static void __subsystem_restart_dev(struct subsys_device *dev)
+ 			wake_lock(&dev->wake_lock);
+ 			queue_work(ssr_wq, &dev->work);
+ 		} else {
+-			panic("CP Crash - Subsystem %s crashed during SSR!", name);
++			pr_err("CP Crash - Subsystem %s crashed during SSR! (continuing)\n", name);
+ 		}
+ 	}
+ 	spin_unlock_irqrestore(&track->s_lock, flags);
+@@ -729,10 +730,13 @@ int subsystem_restart_dev(struct subsys_device *dev)
+ 		__subsystem_restart_dev(dev);
+ 		break;
+ 	case RESET_SOC:
+-		panic("CP Crash - please soft reset and collect cp dump - %s crashed.", name);
++		/* [MDM-bringup] 原为 panic()。改为记录 + 执行 shutdown+powerup，
++		 * 这样用户态可以用 debugfs 的 "restart" 真正复位 modem（冷启动之外唯一手段）。 */
++		pr_err("CP Crash - please soft reset and collect cp dump - %s crashed. (restarting)\n", name);
++		__subsystem_restart_dev(dev);
+ 		break;
+ 	default:
+-		panic("CP Crash - subsys-restart: Unknown restart level!\n");
++		pr_err("CP Crash - subsys-restart: Unknown restart level! (continuing)\n");
+ 		break;
+ 	}
+ 	module_put(dev->owner);
+diff --git a/drivers/esoc/esoc-mdm-4x.c b/drivers/esoc/esoc-mdm-4x.c
+index f3668ed8487..c99280a9cfc 100644
+--- a/drivers/esoc/esoc-mdm-4x.c
++++ b/drivers/esoc/esoc-mdm-4x.c
+@@ -783,9 +783,15 @@ EXPORT_SYMBOL(mdm_get_modem_status);
+ static void mdm_set_hsic_ready(struct esoc_clink *esoc)
+ {
+ 	struct mdm_ctrl *mdm = get_esoc_clink_data(esoc);
+-	gpio_set_value(MDM_GPIO(mdm, AP2MDM_HSIC_READY), 0);
++	int g = MDM_GPIO(mdm, AP2MDM_HSIC_READY);
++	int v0 = gpio_get_value(g);
++	pr_err("[MDM-DIAG] set_hsic_ready ENTER gpio=%d before=%d valid=%d\n",
++		g, v0, gpio_is_valid(g));
++	gpio_set_value(g, 0);
+ 	msleep(10);
+-	gpio_set_value(MDM_GPIO(mdm, AP2MDM_HSIC_READY), 1);
++	pr_err("[MDM-DIAG] set_hsic_ready mid after_set0=%d\n", gpio_get_value(g));
++	gpio_set_value(g, 1);
++	pr_err("[MDM-DIAG] set_hsic_ready EXIT after_set1=%d\n", gpio_get_value(g));
+ }
+ 
+ /* Fail if any of the required gpios is absent. */
+diff --git a/drivers/esoc/esoc-mdm-drv.c b/drivers/esoc/esoc-mdm-drv.c
+index a6b23fae4a2..9ce08278a2d 100644
+--- a/drivers/esoc/esoc-mdm-drv.c
++++ b/drivers/esoc/esoc-mdm-drv.c
+@@ -171,10 +171,12 @@ static int mdm_subsys_powerup(const struct subsys_desc *crashed_subsys)
+ 		}
+ 	}
+ 
++	/* [MDM-bringup] 原为 60000ms；flashless boot 需要逐个镜像会话 + EFS + modem 自身启动，实测约 250-300s，
++	 * 300s 仍会超时并把 modem 拉进 ramdump 模式。放宽到 900s。 */
+ 	if (!wait_for_completion_timeout(&mdm_drv->boot_done,
+-		msecs_to_jiffies(60000))) {
+-		dev_err(&esoc_clink->dev, "Unable to boot\n");
+-		panic("CP BOOT UP FAIL - NEED CP DUMP");
++		msecs_to_jiffies(900000))) {
++		dev_err(&esoc_clink->dev, "Unable to boot (CP BOOT UP FAIL - NEED CP DUMP suppressed)\n");
++		return -EIO;
+ 	}
+ 
+ 	if (mdm_drv->boot_fail) {
+diff --git a/drivers/esoc/esoc_dev.c b/drivers/esoc/esoc_dev.c
+index ec2c78e9571..67268a5b933 100644
+--- a/drivers/esoc/esoc_dev.c
++++ b/drivers/esoc/esoc_dev.c
+@@ -277,7 +277,8 @@ static long esoc_dev_ioctl(struct file *file, unsigned int cmd,
+ 		put_user(status, (unsigned long __user *)uarg);
+ 		break;
+ 	case ESOC_PANIC:
+-		panic("hello packet timeout or secure boot fail");
++		pr_err("hello packet timeout or secure boot fail (panic suppressed)\n");
++		return -EINVAL;
+ 	default:
+ 		return -EINVAL;
+ 	};
+diff --git a/drivers/pci/host/pci-exynos.c b/drivers/pci/host/pci-exynos.c
+index 5e70a3b719b..8d11c08504d 100644
+--- a/drivers/pci/host/pci-exynos.c
++++ b/drivers/pci/host/pci-exynos.c
+@@ -379,7 +379,13 @@ retry:
+ 				if(mdm_get_fatal_status()) {
+ 					return -EPIPE;
+ 				} else {
+-					panic("PCIE LINK UP FAIL - NEED CP DUMP");
++					/* [MDM-bringup] 原为 panic("PCIE LINK UP FAIL - NEED CP DUMP")。
++					 * modem 未上电时链路必然失败，panic 会让系统完全无法启动；
++					 * 改为优雅失败：系统正常启动，之后由用户态给 modem 上电，
++					 * 再从 userspace 触发 PCIe rescan / 重新 bind 完成枚举。 */
++					dev_err(dev, "%s: MDM PCIe link not up (modem unpowered?) - deferring\n",
++							__func__);
++					return -EPROBE_DEFER;
+ 				}
+ 			}
+ #endif
+diff --git a/drivers/usb/misc/ks_bridge.c b/drivers/usb/misc/ks_bridge.c
+index 377373f5573..7d6ce02e41b 100644
+--- a/drivers/usb/misc/ks_bridge.c
++++ b/drivers/usb/misc/ks_bridge.c
+@@ -77,7 +77,12 @@ struct ks_bridge {
+ 	char			*name;
+ 	spinlock_t		lock;
+ 	struct workqueue_struct	*wq;
+-	struct work_struct	to_mdm_work;
++	struct delayed_work	to_mdm_work;
++	unsigned char		*tx_acc;
++	int			tx_acc_len;
++	int			tx_acc_sz;
++	int			req_len;
++	int			req_left;
+ 	struct work_struct	start_rx_work;
+ 	struct list_head	to_mdm_list;
+ 	struct list_head	to_ks_list;
+@@ -290,10 +295,50 @@ static void ksb_tx_cb(struct urb *urb)
+ 	wake_up(&ksb->pending_urb_wait);
+ }
+ 
++/* [MDM-bringup] 把聚合缓冲里的字节打包进 to_mdm_list（不持锁分配，锁内校验） */
++#define KSB_AGG_MAX   16384
++static void ksb_agg_flush_all(struct ks_bridge *ksb)
++{
++	unsigned long flags;
++	struct data_pkt *pkt;
++	int n;
++	unsigned int want;
++
++	spin_lock_irqsave(&ksb->lock, flags);
++	n = ksb->tx_acc_len;
++	spin_unlock_irqrestore(&ksb->lock, flags);
++	if (n <= 0 || n > ksb->tx_acc_sz)
++		return;
++
++	pkt = ksb_alloc_data_pkt(n, GFP_KERNEL, ksb);
++	if (IS_ERR(pkt))
++		return;
++
++	spin_lock_irqsave(&ksb->lock, flags);
++	if (ksb->tx_acc_len != n) {           /* 期间被改过 → 放弃本次，避免越界/错位 */
++		spin_unlock_irqrestore(&ksb->lock, flags);
++		ksb_free_data_pkt(pkt);
++		return;
++	}
++	want = (unsigned int)n;
++	memcpy(pkt->buf, ksb->tx_acc, want);
++	pkt->len = want;
++	ksb->tx_acc_len = 0;
++	ksb->req_left -= (int)want;           /* ★ 递减；减到 0 表示该请求发完 */
++	if (ksb->req_left < 0)
++		ksb->req_left = 0;
++	if (ksb->req_left == 0)
++		ksb->req_len = 0;
++	list_add_tail(&pkt->list, &ksb->to_mdm_list);
++	spin_unlock_irqrestore(&ksb->lock, flags);
++}
++
+ static void ksb_tomdm_work(struct work_struct *w)
+ {
+-	struct ks_bridge *ksb = container_of(w, struct ks_bridge, to_mdm_work);
++	struct ks_bridge *ksb = container_of(to_delayed_work(w), struct ks_bridge, to_mdm_work);
+ 	struct data_pkt	*pkt;
++	ksb_agg_flush_all(ksb);               /* 先把聚合缓冲的残余打成包 */
++	if (ksb->tx_acc_len > 0) return;      /* 极小概率的竞争：下次再来 */
+ 	unsigned long flags;
+ 	struct urb *urb;
+ 	int ret;
+@@ -382,11 +427,70 @@ static ssize_t ksb_fs_write(struct file *fp, const char __user *buf,
+ 		return ret;
+ 	}
+ 
++	/* [MDM-bringup] 诊断：打印 ks 实际写入的字节（纯打印，不改逻辑） */
++	{
++		static int n_small = 0, n_big = 0;
++		if (count <= 64) {
++			if (n_small < 40) {
++				print_hex_dump(KERN_INFO, "KSB-WC: ", DUMP_PREFIX_OFFSET, 16, 1,
++					       pkt->buf, count, false);
++				n_small++;
++			}
++		} else if (n_big < 2) {
++			print_hex_dump(KERN_INFO, "KSB-WD: ", DUMP_PREFIX_OFFSET, 16, 1,
++				       pkt->buf, count > 96 ? 96 : count, false);
++			n_big++;
++		}
++	}
++
++	/* [MDM-bringup v2] ks 的写入粒度是 4 字节（控制包与数据都一样）。
++	 * 三条件任一满足即冲刷：1) 成帧 2) 达阈值 3) 2ms 超时（由 delayed work 触发）。 */
++	if (count <= 8) {
++		unsigned int need; int full; int overflow;
++		spin_lock_irqsave(&ksb->lock, flags);
++		overflow = (ksb->tx_acc_len + (int)count > ksb->tx_acc_sz);
++		if (!overflow) {
++			memcpy(ksb->tx_acc + ksb->tx_acc_len, pkt->buf, count);
++			ksb->tx_acc_len += (int)count;
++		}
++		need = 8;
++		if (!overflow && ksb->tx_acc_len >= 8) {
++			unsigned int l = (unsigned int)ksb->tx_acc[4] | ((unsigned int)ksb->tx_acc[5] << 8) |
++					 ((unsigned int)ksb->tx_acc[6] << 16) | ((unsigned int)ksb->tx_acc[7] << 24);
++			if (l >= 8 && l <= 64)
++				need = l;                     /* 控制包：精确按头长度成帧 */
++			else if (ksb->req_left > 0) {
++				/* ★ 数据：按 modem 请求的剩余量分块（一次最多缓冲大小） */
++				need = (ksb->req_left > ksb->tx_acc_sz) ?
++					(unsigned int)ksb->tx_acc_sz : (unsigned int)ksb->req_left;
++			}
++			else
++				need = KSB_AGG_MAX;           /* 兜底阈值 */
++		}
++		full = (!overflow && ksb->tx_acc_len >= (int)need);
++		spin_unlock_irqrestore(&ksb->lock, flags);
++		ksb_free_data_pkt(pkt);
++		if (overflow) {
++			ksb_agg_flush_all(ksb);           /* 缓冲满：先冲掉，本次写入丢失风险最低 */
++			return count;
++		}
++		if (full) {
++			queue_work(ksb->wq, &ksb->to_mdm_work.work);
++		} else if (need == KSB_AGG_MAX || (ksb->req_left <= 0)) {
++			/* 控制包成帧未凑齐 / 兜底阈值：用 2ms 超时冲刷 */
++			schedule_delayed_work(&ksb->to_mdm_work, msecs_to_jiffies(2));
++		} else {
++			/* ★ 数据路径（等 modem 请求的整块）：**不设超时**，攒满即发，
++			 *   避免超时把 4096 的请求切成 3772 这种尺寸 ✗ */
++		}
++		return count;
++	}
++
+ 	spin_lock_irqsave(&ksb->lock, flags);
+ 	list_add_tail(&pkt->list, &ksb->to_mdm_list);
+ 	spin_unlock_irqrestore(&ksb->lock, flags);
+ 
+-	queue_work(ksb->wq, &ksb->to_mdm_work);
++	queue_work(ksb->wq, &ksb->to_mdm_work.work);
+ 
+ 	return count;
+ }
+@@ -597,6 +701,20 @@ static void ksb_rx_cb(struct urb *urb)
+ 	}
+ 
+ add_to_list:
++	/* [MDM-bringup] 记录 modem 的 READ_DATA 请求长度：TX 聚合据此按"请求边界"分块 */
++	if (urb->actual_length >= 20) {
++		unsigned char *b = (unsigned char *)pkt->buf;
++		unsigned int c = (unsigned int)b[0] | ((unsigned int)b[1] << 8) |
++				 ((unsigned int)b[2] << 16) | ((unsigned int)b[3] << 24);
++		if (c == 3) {                     /* SAHARA_READ_DATA */
++			unsigned int l = (unsigned int)b[16] | ((unsigned int)b[17] << 8) |
++					 ((unsigned int)b[18] << 16) | ((unsigned int)b[19] << 24);
++			if (l > 0 && l <= 16U * 1024U * 1024U && ksb->tx_acc_len == 0) {
++				ksb->req_len = (int)l;
++				ksb->req_left = (int)l;      /* ★ 剩余待发字节（可大于缓冲） */
++			}
++		}
++	}
+ 	spin_lock(&ksb->lock);
+ 	pkt->len = urb->actual_length;
+ 	list_add_tail(&pkt->list, &ksb->to_ks_list);
+@@ -699,6 +817,11 @@ ksb_usb_probe(struct usb_interface *ifc, const struct usb_device_id *id)
+ 	udev = interface_to_usbdev(ifc);
+ 	fbdev = mdev = (struct ksb_dev_info *)id->driver_info;
+ 
++	/* [MDM-DIAG] 看见任何 modem USB 设备被枚举并进入本驱动 */
++	pr_err("[MDM-DIAG] ksb_usb_probe ENTER vid=%04x pid=%04x ifc=%u name=%s\n",
++		udev->descriptor.idVendor, udev->descriptor.idProduct,
++		ifc_num, mdev ? mdev->name : "(null)");
++
+ 	bus_id = str_to_busid(udev->bus->bus_name);
+ 	if (bus_id == BUS_UNDEF) {
+ 		dev_err(&udev->dev, "unknown usb bus %s, probe failed\n",
+@@ -920,7 +1043,7 @@ static void ksb_usb_disconnect(struct usb_interface *ifc)
+ 
+ 	clear_bit(USB_DEV_CONNECTED, &ksb->flags);
+ 	wake_up(&ksb->ks_wait_q);
+-	cancel_work_sync(&ksb->to_mdm_work);
++	cancel_delayed_work_sync(&ksb->to_mdm_work);
+ 	cancel_work_sync(&ksb->start_rx_work);
+ 
+ 	device_destroy(ksb->class, ksb->cdev_start_no);
+@@ -1044,7 +1167,13 @@ static int __init ksb_init(void)
+ 			goto dev_free;
+ 		}
+ 
+-		INIT_WORK(&ksb->to_mdm_work, ksb_tomdm_work);
++		INIT_DELAYED_WORK(&ksb->to_mdm_work, ksb_tomdm_work);
++		/* [MDM-bringup] 聚合缓冲：数据流要攒到 ~16KB 再发（ks 每次只写 4 字节） */
++		ksb->tx_acc_sz = 65536;
++		ksb->tx_acc = kzalloc(ksb->tx_acc_sz, GFP_KERNEL);
++		ksb->tx_acc_len = 0;
++		if (!ksb->tx_acc)
++			pr_err("%s: tx_acc alloc failed (aggregation disabled)\n", ksb->id_info.name);
+ 		INIT_WORK(&ksb->start_rx_work, ksb_start_rx_work);
+ 		init_usb_anchor(&ksb->submitted);
+ 

@@ -115,7 +115,7 @@ static long write_full(long fd,const unsigned char*buf,long n){
 void real_start(unsigned long *sp){
     (void)sp;
     L=sc4(56,-100,(long)"/data/local/tmp/diag/sahara_own.log",0x0241,0644);
-    outs("=== own sahara loader v39 [SET_CRASH + SSR restart] ===\n");
+    outs("=== own sahara loader v40 [no self-reset] ===\n");
 
     /* ★ v33：自己注册为 ESOC req engine —— 这样 mdm_subsys_powerup 不会因"等 req engine"而阻塞，
      *   从而**不需要 mdm_helper**（它会在失败时请求 SSR 重启、把 modem 打进 dump 模式）。 */
@@ -315,21 +315,23 @@ void real_start(unsigned long *sp){
                 /* ★ v35：按 Sahara 规范，全部镜像喂完后发 RESET_REQ，
                  *   让 modem 执行已加载固件（此前那次有 mdm_helper/SSR 干扰，结论不可靠）。 */
                 if(last_id==6 && !crash_req){
-                    /* ★ v39：完整复刻原厂"先 dump 再继续"的顺序 ——
-                     *   1) ESOC_SET_CRASH 标记崩溃（ioctl _IOW(0xCC,9,u32)=0x4004CC09）
-                     *   2) 触发 SSR restart → 驱动走 prepare_debug→ramdump → modem 交出内存区表
-                     *   3) 加载器随后完整 dump 14 个区（已实现 ✓） */
-                    unsigned int one=1;
-                    long r = (esoc_fd>=0) ? sc4(29, esoc_fd, 0x4004CC09, (long)&one, 0) : -1;
-                    outs("  -> [v39] ESOC_SET_CRASH -> "); outn(r); outs("\n");
-                    long sf = sc4(56,-101,(long)"/sys/kernel/debug/msm_subsys/esoc0",1,0);  /* O_WRONLY */
-                    if(sf>=0){
-                        long w = sc4(64, sf, (long)"restart", 7, 0);
-                        outs("  -> [v39] SSR restart write -> "); outn(w); outs("\n");
-                        sc4(57, sf, 0, 0, 0);
-                    } else {
-                        outs("  -> [v39] open ssr node failed "); outn(sf); outs("\n");
-                    }
+                    /* ★★ v40：**移除** v39 的自我破坏逻辑 ★★
+                     *
+                     * 实测证据（本机 dmesg，2026-10-03）：
+                     *   [53.75] Signaling request engine for images → 12 镜像全 status=0
+                     *   [65.22] esoc_dev_ioctl, ESOC_SET_CRASH_OCCURRENCE, status: 1
+                     *           subsys-restart: ... Restart sequence requested for esoc0
+                     *   [65.23] status = 1: mdm is now ready        ← modem 其实起来了
+                     *   [76.42] unexpected reset external modem     ← 11.2s 后被这条 SSR 复位
+                     *
+                     * 即 v39 在最后一个镜像的 DONE_RESP 后立刻调用
+                     *   ESOC_SET_CRASH + 写 "restart" 到 msm_subsys/esoc0
+                     * → 我们自己把刚启动的 modem 复位了。modem 从未有机会常驻。
+                     *
+                     * 现在 boot_done 窗口已是 900s（boot-AD/V），fed 完约 20s，
+                     * 完全不需要"先 dump 再继续"这套 workaround。故此处只记录、不动作。
+                     */
+                    outs("  -> [v40] 全部镜像完成；不触发 SSR/CRASH（避免自我复位）\n");
                     crash_req=1;
                 }
                 done_sent=1;
